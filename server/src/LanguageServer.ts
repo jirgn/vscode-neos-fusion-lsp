@@ -31,6 +31,9 @@ import { SemanticTokensLanguageFeature } from './languageFeatures/SemanticTokens
 import { AbstractFunctionality } from './common/AbstractFunctionality'
 import { addFusionIgnoreSemanticCommentAction } from './actions/AddFusionIgnoreSemanticCommentAction'
 import { CodeLensCapability } from './capabilities/CodeLensCapability'
+import { openDocumentationAction } from './actions/OpenDocumentationAction'
+import { createNodeTypeFileAction } from './actions/CreateNodeTypeFileAction'
+import { ClientCapabilityService } from './common/ClientCapabilityService'
 
 
 export class LanguageServer extends Logger {
@@ -38,6 +41,7 @@ export class LanguageServer extends Logger {
 	protected connection: _Connection
 	protected documents: TextDocuments<FusionDocument>
 	protected fusionWorkspaces: FusionWorkspace[] = []
+	protected clientCapabilityService: ClientCapabilityService
 
 	protected functionalityInstances: Map<new (...args: unknown[]) => AbstractFunctionality, AbstractFunctionality> = new Map()
 
@@ -106,6 +110,8 @@ export class LanguageServer extends Logger {
 			this.logInfo(`Added FusionWorkspace ${workspaceFolder.name} with path ${uriToPath(workspaceFolder.uri)}`)
 		}
 
+		this.clientCapabilityService = new ClientCapabilityService(params.capabilities)
+
 		return {
 			capabilities: {
 				inlayHintProvider: true,
@@ -114,6 +120,7 @@ export class LanguageServer extends Logger {
 					triggerCharacters: [`"`, `'`, `/`, `.`, `:`, `@`]
 				},
 				textDocumentSync: {
+					// TODO: Make `params.initializationOptions` optional by defining some kind of default
 					openClose: params.initializationOptions.textDocumentSync.openClose,
 					change: TextDocumentSyncKind.Full
 				},
@@ -203,58 +210,83 @@ export class LanguageServer extends Logger {
 		}
 	}
 
-	protected handleFileChanged(change: FileEvent) {
-		if (!change.uri.endsWith(".php")) return
-
-		clearLineDataCacheForFile(change.uri)
-
+	protected handleNodeTypeFileChanged() {
 		for (const workspace of this.fusionWorkspaces) {
-			for (const [_, neosPackage] of workspace.neosWorkspace.getPackages().entries()) {
-				const helper = neosPackage.getEelHelpers().find(helper => helper.uri === change.uri)
-				if (!helper) continue
+			for (const neosPackage of workspace.neosWorkspace.getPackages().values()) {
+				neosPackage.readConfiguration()
+			}
+		}
+		for (const workspace of this.fusionWorkspaces) workspace.diagnoseAllFusionFiles()
+	}
 
-				this.logVerbose(`  File was EEL-Helper ${helper.name}`)
+	protected handleFileChanged(change: FileEvent) {
+		if ((change.uri.endsWith(".yaml") || change.uri.endsWith(".yml")) && change.uri.includes("NodeTypes")) {
+			this.handleNodeTypeFileChanged()
+		}
 
-				const namespace = helper.namespace
-				const classDefinition = namespace.getClassDefinitionFromFilePathAndClassName(uriToPath(helper.uri), helper.className, helper.pathParts)
+		if (change.uri.endsWith(".php")) {
+			clearLineDataCacheForFile(change.uri)
 
-				this.logVerbose(`  Methods: then ${helper.methods.length} now ${classDefinition.methods.length}`)
+			for (const workspace of this.fusionWorkspaces) {
+				for (const [_, neosPackage] of workspace.neosWorkspace.getPackages().entries()) {
+					const helper = neosPackage.getEelHelpers().find(helper => helper.uri === change.uri)
+					if (!helper) continue
 
-				helper.methods = classDefinition.methods
-				helper.position = classDefinition.position
+					this.logVerbose(`  File was EEL-Helper ${helper.name}`)
+
+					const namespace = helper.namespace
+					const classDefinition = namespace.getClassDefinitionFromFilePathAndClassName(uriToPath(helper.uri), helper.className, helper.pathParts)
+
+					this.logVerbose(`  Methods: then ${helper.methods.length} now ${classDefinition.methods.length}`)
+
+					helper.methods = classDefinition.methods
+					helper.position = classDefinition.position
+				}
 			}
 		}
 	}
 
 	protected handleFileCreated(change: FileEvent) {
-		if (!change.uri.endsWith(".fusion")) return
-		const workspace = this.getWorkspaceForFileUri(change.uri)
-		if (!workspace) {
-			this.logInfo(`Created Fusion file corresponds to no workspace. ${change.uri}`)
-			return
+		if ((change.uri.endsWith(".yaml") || change.uri.endsWith(".yml")) && change.uri.includes("NodeTypes")) {
+			this.handleNodeTypeFileChanged()
 		}
 
-		const neosPackage = workspace.neosWorkspace.getPackageByUri(change.uri)
-		workspace.addParsedFileFromPath(uriToPath(change.uri), neosPackage)
-		this.logDebug(`Added new ParsedFusionFile ${change.uri}`)
+		if (change.uri.endsWith(".fusion")) {
+			const workspace = this.getWorkspaceForFileUri(change.uri)
+			if (!workspace) {
+				this.logInfo(`Created Fusion file corresponds to no workspace. ${change.uri}`)
+				return
+			}
+
+			const neosPackage = workspace.neosWorkspace.getPackageByUri(change.uri)
+			workspace.addParsedFileFromPath(uriToPath(change.uri), neosPackage)
+			this.logDebug(`Added new ParsedFusionFile ${change.uri}`)
+		}
 	}
 
 	protected handleFileDeleted(change: FileEvent) {
 		clearLineDataCacheForFile(change.uri)
 
-		if (!change.uri.endsWith(".fusion")) return
-		const workspace = this.getWorkspaceForFileUri(change.uri)
-		if (!workspace) {
-			this.logInfo(`Deleted Fusion file corresponds to no workspace. ${change.uri}`)
-			return
+		if ((change.uri.endsWith(".yaml") || change.uri.endsWith(".yml")) && change.uri.includes("NodeTypes")) {
+			this.handleNodeTypeFileChanged()
 		}
-		workspace.removeParsedFile(change.uri)
+
+		if (change.uri.endsWith(".fusion")) {
+			const workspace = this.getWorkspaceForFileUri(change.uri)
+			if (!workspace) {
+				this.logInfo(`Deleted Fusion file corresponds to no workspace. ${change.uri}`)
+				return
+			}
+			workspace.removeParsedFile(change.uri)
+		}
 	}
 
 	public async onCodeAction(params: CodeActionParams) {
 		return [
-			...await addFusionIgnoreSemanticCommentAction(params),
-			...replaceDeprecatedQuickFixAction(params)
+			...await addFusionIgnoreSemanticCommentAction(this, params),
+			...replaceDeprecatedQuickFixAction(this, params),
+			...openDocumentationAction(this, params),
+			...createNodeTypeFileAction(this, params)
 		]
 	}
 
